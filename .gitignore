@@ -5,6 +5,7 @@
 # Log files
 *.log
 *.rpt
+ComponentUpdateLog.txt
 
 # Temp directry
 *.cydsn/codegentemp/*
