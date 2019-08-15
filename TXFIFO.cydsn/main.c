@@ -65,7 +65,7 @@ void uartTxIsr(void) {
             uartTxCount = 0;
             uartTxReject = 0;
         } else {
-            // Expect
+            // Expect next time
         }
     }
     CyExitCriticalSection(state);
