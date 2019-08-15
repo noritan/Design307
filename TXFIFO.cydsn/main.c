@@ -11,60 +11,61 @@
 */
 #include "project.h"
 
-// FIFO 機能のON/OFF
+// Uncomment when Disable the FIFO function.
 //#define NOFIFO
 
-// USBUARTのパケットサイズ
+// The packet size of the USBUART
+// is used for the FIFO buffer size too.
 #define     UART_TX_QUEUE_SIZE      (64)
 
-// USBUARTのTXキューバッファ
-uint8       uartTxQueue[UART_TX_QUEUE_SIZE];    // TXキュー
-uint8       uartTxCount = 0;                    // TXキューに存在するデータ数
-CYBIT       uartZlpRequired = 0;                // 要ZLPフラグ
-uint8       uartTxReject = 0;                   // 送信不可回数
+// TX buffer declaration
+uint8       uartTxQueue[UART_TX_QUEUE_SIZE];    // Queue buffer for TX
+uint8       uartTxCount = 0;                    // Number of data bytes contained in the TX buffer
+CYBIT       uartZlpRequired = 0;                // Flag to indicate the ZLP is required
+uint8       uartTxReject = 0;                   // The count of trial rejected by the TX endpoint
 
 #ifdef NOFIFO
     
-// 1バイトを送信する関数
+// Function to send one byte to USBUART
 static void putch_sub(const int16 ch) {
-    // FIFOを使わない時は、PutChar()をそのまま使う
+    // PutChar() function is used if no FIFO used
     USBUART_PutChar(ch);
 }
 
 #else // define(NOFIFO)
 
-// 1バイトを送信する関数
+// Function to send one byte to USBUART
 static void putch_sub(const int16 ch) {
     uint8 state;
     for (;;) {
-        // 送信キューが空くまで待つ
+        // Wait until the TX buffer is EMPTY
         state = CyEnterCriticalSection();
         if (uartTxCount < UART_TX_QUEUE_SIZE) break;
         CyExitCriticalSection(state);
     }
-    // 送信キューに一文字入れる
+    // Store one byte into the TX buffer
     uartTxQueue[uartTxCount++] = ch;
     CyExitCriticalSection(state);
 }
 
-// 送信側割り込みサービス制御
+// TX side Interrupt Service Routine
 void uartTxIsr(void) {
     uint8 state = CyEnterCriticalSection();
     if ((uartTxCount > 0) || uartZlpRequired) {
-        // バッファにデータが存在する、または、ZLPが必要な時にパケットを送る
+        // Send a packet if the TX buffer has any data or an ZLP packet is required.
         if (USBUART_CDCIsReady()) {
-            // 送信可能なら - パケットを送る
+            // Send a packet if the USBUART accepted.
             USBUART_PutData(uartTxQueue, uartTxCount);
-            // バッファをクリアする
+            // Clear the buffer
             uartZlpRequired = (uartTxCount == UART_TX_QUEUE_SIZE);
             uartTxCount = 0;
             uartTxReject = 0;
         } else if (++uartTxReject > 4) {
-            // 送信不可が続いたら - バッファのデータを棄てる
+            // Discard the TX buffer content if USBUART does not accept four times.
             uartTxCount = 0;
             uartTxReject = 0;
         } else {
-            // 次回に期待
+            // Expect
         }
     }
     CyExitCriticalSection(state);
@@ -72,24 +73,24 @@ void uartTxIsr(void) {
 
 #endif // define(NOFIFO)
 
-// USBUARTに一文字送る
+// Send one character to USBUART
 void putch(const int16 ch) {
     if (ch == '\n') {
-        // LFをCRLFに変換する
+        // Convert LF to CRLF
         putch_sub('\r');
     }
     putch_sub(ch);
 }
 
-// USBUARTに文字列を送り込む
+// Send a character string to USBUART
 void putstr(const char *s) {
-    // 行末まで表示する
+    // Send characters to the end of line
     while (*s) {
         putch(*s++);
     }
 }
 
-// 32-bit十進数表
+// 32-bit power of ten table
 static const uint32 CYCODE pow10_32[] = {
     0L,
     1L,
@@ -104,31 +105,32 @@ static const uint32 CYCODE pow10_32[] = {
     1000000000L,
 };
 
-// 32-bit数値の十進表示 - ZERO SUPPRESS は省略。
+// Show 32-bit decimal value
+// Not supporting ZERO SUPPRESS feature.
 void putdec32(uint32 num, const uint8 nDigits) {
     uint8       i;
     uint8       k;
     CYBIT       show = 0;
 
-    // 表示すべき桁数
+    // Number of digits to be shown
     i = sizeof pow10_32 / sizeof pow10_32[0];
-    while (--i > 0) {             // 一の位まで表示する
-        // i桁目の数値を得る
+    while (--i > 0) {             // Show until last digit
+        // Get the i-th digit value
         for (k = 0; num >= pow10_32[i]; k++) {
             num -= pow10_32[i];
         }
-        // 表示すべきか判断する
+        // Specify if the digit should be shown or not.
         show = show || (i <= nDigits) || (k != 0);
-        // 必要なら表示する
+        // Show the digit if required.
         if (show) {
-            putch(k + '0');     // 着目桁の表示
+            putch(k + '0');
         }
     }
 }
 
 #ifndef NOFIFO
     
-// 周期的にUSBUARTの送受信を監視する
+// Periodically check the TX and RX of USBUART
 CY_ISR(int_uartQueue_isr) {
     uartTxIsr();
 }
@@ -136,35 +138,35 @@ CY_ISR(int_uartQueue_isr) {
 #endif // !define(NOFIFO)
 
 int main(void) {
-    uint32 nLine = 0;           // 行番号
+    uint32 nLine = 0;           // Line number
     
-    CyGlobalIntEnable;                          // 割り込みの有効化    
-    USBUART_Start(0, USBUART_5V_OPERATION);     // 動作電圧5VにてUSBFSコンポーネントを初期化
+    CyGlobalIntEnable;                          // Enable interrupts    
+    USBUART_Start(0, USBUART_5V_OPERATION);     // Initialize USBFS using 5V power supply
 
 #ifndef NOFIFO
     
-    int_uartQueue_StartEx(int_uartQueue_isr);   // 周期タイマを起動する
+    int_uartQueue_StartEx(int_uartQueue_isr);   // Initialize the periodic timer
 
 #endif // !define(NOFIFO)
 
     for(;;) {
-        // 初期化終了まで待機
+        // Wait for initialization completed
         while (USBUART_GetConfiguration() == 0);
 
-        USBUART_IsConfigurationChanged();       // CHANGEフラグを確実にクリアする
-        USBUART_CDC_Init();                     // CDC機能を起動する
+        USBUART_IsConfigurationChanged();       // Ensure to clear the CHANGE flag
+        USBUART_CDC_Init();                     // Initialize the CDC feature
 
         for (;;) {
-            // 設定が変更されたら、再初期化をおこなう
+            // Re-initialize if the configuration is changed
             if (USBUART_IsConfigurationChanged()) {
                 break;
             }
 
-            // CDC-IN : ホストにメッセージを送る
+            // CDC-IN : Send a message to the HOST
             putdec32(nLine++, 7);
             putstr(" - HELLO WORLD HELLO WORLD HELLO WORLD HELLO WORLD\n");
             
-            // CDC-Control : 制御コマンドは無視する
+            // CDC-Control : Ignore all control commands
             (void)USBUART_IsLineChanged();
         }
     }
