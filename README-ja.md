@@ -1,5 +1,5 @@
 ---
-title: USBUARTのTXにFIFOを装備する
+title: USBUARTにFIFOを装備する
 tags: PSoC5 USBUART FIFO
 author: noritan_org
 slide: false
@@ -166,8 +166,8 @@ void uartTxIsr(void) {
 これは、周期割り込みよりも優先順位の高い割り込みからデータ送信関数が呼ばれる場合を想定したものです。
 
 パケットを送信する条件は、バッファにデータが入っているかまたは「要ZLPフラグ」がセットされている事です。
-**USBUART**が受け入れられる場合にはバッファの中身を送信します。
-**USBUART**が拒否した場合には`uartTxReject` をインクリメントし、規定の回数以上拒否されていたらパケットを破棄します。
+**USBUART**からの送信が受け入れ可能な場合にはバッファの中身を送信します。
+**USBUART**が送信を拒否した場合には`uartTxReject` をインクリメントし、規定の回数以上拒否されていたらパケットを破棄します。
 
 ```c:main.c
 // Send one character to USBUART
@@ -314,6 +314,249 @@ int main(void) {
 マクロ**NOFIFO**を使って、**FIFO**を使わない場合の動作も確認しました。
 すると、表示が乱れて使い物になりません。
 どこに問題が有るのか究明はしていませんが、スループットが高い場合には**FIFO**を入れないと話にならないという事がわかりました。
+
+
+## USBUARTのRXにFIFOを装備する
+
+次は、**RX**側にも**FIFO**を実装します。
+
+### RX側FIFOの考え方
+
+**RX**側の**FIFO**も**TX**側と同じ考え方で実装します。
+
+1. 周期的にエンドポイントを監視して、データが届いていたらバッファが空である事を確認してバッファにデータを取り込む。
+2. 一文字取り出し関数でバッファから文字を取り出す。
+
+実は、この動作そのものは**FIFO**を使う場合でも使わない場合でも同じです。
+これは、エンドポイントに貯まったデータを一文字ずつ取り出す方法がないために、すべてのデータを取り出さなくてはならないためです。
+
+エンドポイントの監視周期は、**TX**側と同じ2kHzの割り込みを使います。
+
+
+### ファームウェア
+
+回路図およびコンポーネントの設定は、**TX**側に**FIFO**を装備した場合と同じです。
+ファームウェアは、以下のようになりました。
+
+```main.c
+#include "project.h"
+
+// Uncomment when Disable the FIFO function.
+//#define NOFIFO
+
+// The packet size of the USBUART
+// is used for the FIFO buffer size too.
+#define     UART_TX_QUEUE_SIZE      (64)
+#define     UART_RX_QUEUE_SIZE      (64)
+```
+
+冒頭の部分には、受信で使うパケットのサイズ定義が追加されています。
+送信の場合と同じように、**USBUART**が使用する**BULK**パケットのサイズをそのまま**FIFO**バッファのサイズとしています。
+
+```main.c
+// TX buffer declaration
+uint8       uartTxQueue[UART_TX_QUEUE_SIZE];    // Queue buffer for TX
+uint8       uartTxCount = 0;                    // Number of data bytes contained in the TX buffer
+CYBIT       uartZlpRequired = 0;                // Flag to indicate the ZLP is required
+uint8       uartTxReject = 0;                   // The count of trial rejected by the TX endpoint
+
+// RX buffer declaration
+uint8       uartRxQueue[UART_RX_QUEUE_SIZE];    // Queue buffer for RX
+uint8       uartRxCount = 0;                    // Number of data bytes contained in the TX buffer
+uint8       uartRxIndex = 0;                    // Index on RX buffer to get a byte
+CYBIT       uartRxCRDetect = 0;                 // CR detection flag
+```
+
+送信の時に定義した送信バッファの定義の後、受信バッファの定義が続きます。
+受信の場合だけに宣言されている`uartRxCRDetect`は、行末記号として**CR**を受信した場合にセットされます。
+行末記号として**CR**+**LF**を受信した場合、このフラグがセットされた状態で**LF**を受信する事になります。
+このようなときには、**CR**が送られてきた時に行末符号を返して、次の**LF**を無視しています。
+
+この後、送信に関する記述が続きますが、ここでは、省略します。
+
+```main.c
+#ifdef NOFIFO
+
+// Functio to receive one byte
+int16 getch_sub(void) {
+    int16 ch = -1;
+    uint8 state = CyEnterCriticalSection();
+
+    if (uartRxIndex >= uartRxCount) {
+        // RX buffer is empty
+        if (USBUART_DataIsReady()) {
+            // and data arrives at USBUART
+            // receive data to RX buffer
+            uartRxCount = USBUART_GetAll(uartRxQueue);
+            uartRxIndex = 0;
+        }
+    }
+    if (uartRxIndex < uartRxCount) {
+        // If any characters left in RX buffer
+        // get a byte from RX buffer
+        ch = uartRxQueue[uartRxIndex++];
+    }
+    CyExitCriticalSection(state);
+    return ch;
+}
+```
+
+**FIFO**を使わない場合、この関数が１バイトの受信に使用されます。
+前半では、受信バッファに確実にデータを準備しています。
+具体的には、受信バッファが空の場合に限りエンドポイントからデータをバッファに取り出しています。
+
+後半では、受信バッファから１バイトのデータを取り出して、関数の返り値としています。
+
+この関数を使用した場合、次のパケットをこの関数の中で受け取るために、文字が受信されるまで処理が止まってしまう可能性が有ります。
+
+```main.c
+#else // define(NOFIFO)
+
+// RX side Interrupt Service Routine
+void uartRxIsr(void) {
+    uint8 state = CyEnterCriticalSection();
+    if (uartRxIndex >= uartRxCount) {
+        // If RX buffer is EMPTY
+        if (USBUART_DataIsReady()) {
+            // and data arrives at USBUART
+            // receive data to RX buffer
+            uartRxCount = USBUART_GetAll(uartRxQueue);
+            uartRxIndex = 0;
+        }
+    }
+    CyExitCriticalSection(state);
+}
+```
+
+これに対して、**FIFO**を使う場合には、エンドポイントからデータを取り出す前半部分を周期割り込みで処理して、後半部分をメインループ内で処理しています。
+この割り込みサービスルーチンも、"Critical Section"をつくって、他の割り込みの介入を排除しています。
+
+```main.c
+// Function to get one byte from USBUART
+int16 getch_sub(void) {
+    int16 ch = -1;
+    uint8 state = CyEnterCriticalSection();
+    
+    if (uartRxIndex < uartRxCount) {
+        // If any characters left in RX buffer
+        // get a byte from RX buffer
+        ch = uartRxQueue[uartRxIndex++];
+    }
+    CyExitCriticalSection(state);
+    return ch;
+}
+
+#endif // define(NOFIFO)
+```
+
+後半部分は、１バイト受信関数に記述されています。
+受信バッファからデータを取り出すだけの簡単な構成です。
+
+```main.c
+// Get one character from USBUART
+int16 getch(void) {
+    int16 ch = getch_sub();
+    if (uartRxCRDetect && ch == '\n') {
+        uartRxCRDetect = 0;
+        ch = getch_sub();
+    } else if (ch == '\r') {
+        ch = '\n';
+        uartRxCRDetect = 1;
+    }
+    return ch;
+}
+```
+
+実際に一文字を返す関数では、行末記号の処理を行っています。
+この処理により、行末が**CR**、**LF**、**CR**+**LF**のいずれであっても、'\n'を返す事ができます。
+
+```main.c
+#ifndef NOFIFO
+    
+// Periodically check the TX and RX of USBUART
+CY_ISR(int_uartQueue_isr) {
+    uartTxIsr();
+    uartRxIsr();
+}
+
+#endif // !define(NOFIFO)
+```
+
+割り込み処理ルーチンには、送信処理に使われていた関数に加えて受信処理に使われる関数が追加されました。
+
+```main.c
+int main(void) {
+    uint32 nLine = 0;           // Line number
+    uint32 nChars = 0;          // Number of characters
+    
+    CyGlobalIntEnable;                          // Enable interrupts
+    USBUART_Start(0, USBUART_5V_OPERATION);     // Initialize USBFS using 5V power supply
+
+#ifndef NOFIFO
+    
+    int_uartQueue_StartEx(int_uartQueue_isr);   // Initialize the periodic timer
+
+#endif // !define(NOFIFO)
+
+    for(;;) {
+        // Wait for initialization completed
+        while (USBUART_GetConfiguration() == 0);
+
+        USBUART_IsConfigurationChanged();       // Ensure to clear the CHANGE flag
+        USBUART_CDC_Init();                     // Initialize the CDC feature
+
+        for (;;) {
+            // Re-initialize if the configuration is changed
+            if (USBUART_IsConfigurationChanged()) {
+                break;
+            }
+
+            // CDC-OUT : Show the number of characters in a received line.
+            {
+                int16 ch = getch();
+                if (ch >= 0) {
+                    nChars++;
+                    if (ch == '\n') {
+                        putdec32(nLine, 7);
+                        putstr(" - ");
+                        putdec32(nChars, 7);
+                        putstr("\n");
+                        nLine++;
+                        nChars = 0;
+                    }
+                }
+            }
+            
+            // CDC-Control : Ignore all control commands
+            (void)USBUART_IsLineChanged();
+        }
+    }
+}
+```
+
+メインループにこのアプリケーションの処理が記述されています。
+このアプリケーションでは、受信したデータの行ごとに文字数を数えて、行番号と文字数を送信します。
+文字数を見る事で受信データに抜けや重複が無いかを確認し、行番号を見る事で受信したデータ量を求めることができます。
+
+
+### 実行してみた
+
+![FIFOを使ったら](./images/outputWithFifo2.png)
+
+プロジェクトが出来たので実行してみました。
+**TeraTerm**から一行59文字の巨大なテキストファイルを送り込んでみました。
+行末が**CR**+**LF**になっているため、出力に表示される一行当たりの文字数は58バイトになっています。
+
+10万行のデータを送って所要時間を測定したところ、98秒かかりました。実効スループットは59kiB/sと計算できます。
+
+
+## FIFOを使わなかったら
+
+![FIFOを使わなかったら](./images/outputWithoutFifo2.png)
+
+**FIFO**を使わない設定も試してみましたが、やはりボロボロになってしまいました。
+送信側がうまく働いていないのだから、あたりまえと言えばあたりまえですが。
+
 
 
 [PSoC Advent Calendar 2016]:https://www.adventar.org/calendars/1796
