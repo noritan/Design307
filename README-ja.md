@@ -1,5 +1,5 @@
 ---
-title: USBUARTのTXにFIFOを装備する
+title: USBUARTにFIFOを装備する
 tags: PSoC5 USBUART FIFO
 author: noritan_org
 slide: false
@@ -166,8 +166,8 @@ void uartTxIsr(void) {
 これは、周期割り込みよりも優先順位の高い割り込みからデータ送信関数が呼ばれる場合を想定したものです。
 
 パケットを送信する条件は、バッファにデータが入っているかまたは「要ZLPフラグ」がセットされている事です。
-**USBUART**が受け入れられる場合にはバッファの中身を送信します。
-**USBUART**が拒否した場合には`uartTxReject` をインクリメントし、規定の回数以上拒否されていたらパケットを破棄します。
+**USBUART**空の送信が受け入れ可能な場合にはバッファの中身を送信します。
+**USBUART**が送信を拒否した場合には`uartTxReject` をインクリメントし、規定の回数以上拒否されていたらパケットを破棄します。
 
 ```c:main.c
 // Send one character to USBUART
