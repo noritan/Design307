@@ -318,6 +318,253 @@ The output is destroyed.
 It was found that the **USBUART** interface cannot be used in the higher throughput case. 
 
 
+## Implementing FIFO to USBUART RX on PSoC 5LP
+
+Another **FIFO** is implemented to the **RX** side in this section.
+
+
+### Idea for RX side FIFO
+
+**RX** side **FIFO** is implemented as well as the **TX** side **FIFO** as follows.
+
+1. Periodically monitor the endpoint and fill the buffer with the received data if the buffer is EMPTY.
+2. Get a character from the buffer using a function getting one character.
+
+The behavior using no **FIFO** is same as one using **FIFO**.
+This is because there is no method to get one character from the data arrived at the endpoint and all data must be gotten from the endpoint.
+
+The endpoint monitoring frequency is configured as 2kHz as well as the **TX** side.
+
+
+### Firmware
+
+The schematic and the component configuration are same as the **TX** side implementation.
+The firmware is described as follows.
+
+```main.c
+#include "project.h"
+
+// Uncomment when Disable the FIFO function.
+//#define NOFIFO
+
+// The packet size of the USBUART
+// is used for the FIFO buffer size too.
+#define     UART_TX_QUEUE_SIZE      (64)
+#define     UART_RX_QUEUE_SIZE      (64)
+```
+
+A packet size declaration for RX buffer is added.
+The **FIFO** buffer size is equal to the maximum **BULK** packet size used by the **USBUART** component as well as the **TX** side buffer size.
+
+```main.c
+// TX buffer declaration
+uint8       uartTxQueue[UART_TX_QUEUE_SIZE];    // Queue buffer for TX
+uint8       uartTxCount = 0;                    // Number of data bytes contained in the TX buffer
+CYBIT       uartZlpRequired = 0;                // Flag to indicate the ZLP is required
+uint8       uartTxReject = 0;                   // The count of trial rejected by the TX endpoint
+
+// RX buffer declaration
+uint8       uartRxQueue[UART_RX_QUEUE_SIZE];    // Queue buffer for RX
+uint8       uartRxCount = 0;                    // Number of data bytes contained in the TX buffer
+uint8       uartRxIndex = 0;                    // Index on RX buffer to get a byte
+CYBIT       uartRxCRDetect = 0;                 // CR detection flag
+```
+
+There is an RX buffer declaration as well as the TX buffer.
+There is an **RX** buffer specific variable `uartRXCRDetected` to indicate that **CR** is received as the last end of line symbol.
+When a sequence **CR**+**LF** is received as an end of line symbol, **LF** is received during the `uartRXCRDetected` flag is asserted.
+In this case, the function getting one character returns an end of line symbol when **CR** is detected and the **LF** following the **CR** is ignored.
+
+There are **TX** side descriptions following the variable declaration as described in last section.
+These descriptions are omitted in this section.
+
+```main.c
+#ifdef NOFIFO
+
+// Functio to receive one byte
+int16 getch_sub(void) {
+    int16 ch = -1;
+    uint8 state = CyEnterCriticalSection();
+
+    if (uartRxIndex >= uartRxCount) {
+        // RX buffer is empty
+        if (USBUART_DataIsReady()) {
+            // and data arrives at USBUART
+            // receive data to RX buffer
+            uartRxCount = USBUART_GetAll(uartRxQueue);
+            uartRxIndex = 0;
+        }
+    }
+    if (uartRxIndex < uartRxCount) {
+        // If any characters left in RX buffer
+        // get a byte from RX buffer
+        ch = uartRxQueue[uartRxIndex++];
+    }
+    CyExitCriticalSection(state);
+    return ch;
+}
+```
+
+When **FIFO** is not used, this function is used to get one byte data.
+In the first half of the function, it is ensure that the RX buffer has at least one byte data.
+In particular the RX buffer is filled by the data from the endpoint when the RX buffer is EMPTY.
+
+In the second half of the function, one byte data is gotten from the RX buffer and is returned as a return value of this function.
+
+When this function is used, the application may be stopped until any character data are received as a **USB** packet because the next packet is received in this function only.
+
+```main.c
+#else // define(NOFIFO)
+
+// RX side Interrupt Service Routine
+void uartRxIsr(void) {
+    uint8 state = CyEnterCriticalSection();
+    if (uartRxIndex >= uartRxCount) {
+        // If RX buffer is EMPTY
+        if (USBUART_DataIsReady()) {
+            // and data arrives at USBUART
+            // receive data to RX buffer
+            uartRxCount = USBUART_GetAll(uartRxQueue);
+            uartRxIndex = 0;
+        }
+    }
+    CyExitCriticalSection(state);
+}
+```
+
+When **FIFO** is used, the first half procedure is executed in the periodic interrupt service routine, and the second half procedure is executed in the main loop.
+There is a "Critical Section" in this interrupt service routine to prevent from other interrupts.
+
+```main.c
+// Function to get one byte from USBUART
+int16 getch_sub(void) {
+    int16 ch = -1;
+    uint8 state = CyEnterCriticalSection();
+    
+    if (uartRxIndex < uartRxCount) {
+        // If any characters left in RX buffer
+        // get a byte from RX buffer
+        ch = uartRxQueue[uartRxIndex++];
+    }
+    CyExitCriticalSection(state);
+    return ch;
+}
+
+#endif // define(NOFIFO)
+```
+
+The second half procedure is described in the function `getch_sub()` getting one character.
+This is a simple function to get one byte from the RX buffer.
+
+```main.c
+// Get one character from USBUART
+int16 getch(void) {
+    int16 ch = getch_sub();
+    if (uartRxCRDetect && ch == '\n') {
+        uartRxCRDetect = 0;
+        ch = getch_sub();
+    } else if (ch == '\r') {
+        ch = '\n';
+        uartRxCRDetect = 1;
+    }
+    return ch;
+}
+```
+
+The end of line symbol is handled in the function `getch()` to get one character.
+With this procedure this function can return a character '\n' for any symbol from **CR**, **LF**, and **CR**+**LF**.
+
+```main.c
+#ifndef NOFIFO
+    
+// Periodically check the TX and RX of USBUART
+CY_ISR(int_uartQueue_isr) {
+    uartTxIsr();
+    uartRxIsr();
+}
+
+#endif // !define(NOFIFO)
+```
+
+The **RX** side interrupt service function is added to the periodic interrupt service routine in addition to the **TX** side interrupt service function.
+
+```main.c
+int main(void) {
+    uint32 nLine = 0;           // Line number
+    uint32 nChars = 0;          // Number of characters
+    
+    CyGlobalIntEnable;                          // Enable interrupts
+    USBUART_Start(0, USBUART_5V_OPERATION);     // Initialize USBFS using 5V power supply
+
+#ifndef NOFIFO
+    
+    int_uartQueue_StartEx(int_uartQueue_isr);   // Initialize the periodic timer
+
+#endif // !define(NOFIFO)
+
+    for(;;) {
+        // Wait for initialization completed
+        while (USBUART_GetConfiguration() == 0);
+
+        USBUART_IsConfigurationChanged();       // Ensure to clear the CHANGE flag
+        USBUART_CDC_Init();                     // Initialize the CDC feature
+
+        for (;;) {
+            // Re-initialize if the configuration is changed
+            if (USBUART_IsConfigurationChanged()) {
+                break;
+            }
+
+            // CDC-OUT : Show the number of characters in a received line.
+            {
+                int16 ch = getch();
+                if (ch >= 0) {
+                    nChars++;
+                    if (ch == '\n') {
+                        putdec32(nLine, 7);
+                        putstr(" - ");
+                        putdec32(nChars, 7);
+                        putstr("\n");
+                        nLine++;
+                        nChars = 0;
+                    }
+                }
+            }
+            
+            // CDC-Control : Ignore all control commands
+            (void)USBUART_IsLineChanged();
+        }
+    }
+}
+```
+
+There is an application logic in the main loop.
+In this application, the number of characters is counted for each line recevied from **USBUART** and the line number and the number of characters are sent to **USBUART** component.
+It is available to confirm if any data is missing by monitoring the number of characters.
+And it is also available to calculate the amount of received data from the line number.
+
+
+### Execution
+
+![Executed with FIFO](./images/outputWithFifo2.png)
+
+After building and programming the project, the project is executed.
+A large text file consisting of 59 characters line is sent from **Tera Term**
+Because the end of line symbols are **CR**+**LF** the number of characters displayed in **Tera Term** is 58.
+
+When a 100,000 line text file is sent, it takes 98 seconds.
+The effective throughput is calculated as 59 kiB/s.
+
+
+### When no FIFO used
+
+![Executed without FIFO](./images/outputWithoutFifo1.png)
+
+As well as the previous section, a configuration not to use **FIFO** is tried.
+But the output on the **Tera Term** is broken.
+This is because the **TX** side is not working well.
+
+
 [japanese]:./README-ja.md
 [PSoC Advent Calendar 2016]:https://www.adventar.org/calendars/1796
 [GitHub Repository]:https://github.com/noritan/Design307
